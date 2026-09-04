@@ -282,35 +282,43 @@ comp.tool(%*{"onDemand": true}):
 
 # ---------------------------------------------------------------------------
 # models-catalog source plugin (hidden; docs/MANUAL.md §Source plugins)
+# Registered via the low-level API: x-models-source is a top-level schema
+# key, not part of x-harness.
 
-comp.tool(%*{"hidden": true, "timeoutMs": 20000}):
-  proc synthetic_models_source(version: int = 1): JsonNode =
-    ## Synthetic.new model metadata for the models component
-    ## (x-models-source v1): a JSON Merge Patch that refreshes the
-    ## "synthetic" provider block with live ids, limits and $/Mtok costs
-    ## from GET /v1/models.
-    ## - version: models source protocol version
-    if version != 1:
-      raise newException(ValueError, "unsupported models source version " & $version)
-    let data = synRequest(HttpGET, "/v1/models"){"data"}
-    var models = newJObject()
-    for m in data:
-      let id = m{"id"}.getStr("")
-      if id.len == 0: continue
-      let p = m{"pricing"}
-      var entry = %*{"id": id,
-                     "name": m{"hugging_face_id"}.getStr(id),
-                     "limit": {"context": m{"context_length"}.getInt(0),
-                               "output": m{"max_output_length"}.getInt(0)},
-                     "cost": {"input": perM(p{"prompt"}.getStr("")),
-                              "output": perM(p{"completion"}.getStr("")),
-                              "cache_read": perM(p{"input_cache_reads"}.getStr(""))}}
-      let feats = m{"supported_features"}
-      entry["reasoning"] = %hasStr(feats, "reasoning")
-      entry["attachment"] = %hasStr(m{"input_modalities"}, "image")
-      models[id] = entry
-    %*{"patch": {"synthetic": {"id": "synthetic", "name": "Synthetic",
-                               "models": models}}}
+proc modelsSourceImpl(version: int): JsonNode =
+  if version != 1:
+    raise newException(ValueError, "unsupported models source version " & $version)
+  let data = synRequest(HttpGET, "/v1/models"){"data"}
+  var models = newJObject()
+  for m in data:
+    let id = m{"id"}.getStr("")
+    if id.len == 0: continue
+    let p = m{"pricing"}
+    var entry = %*{"id": id,
+                   "name": m{"hugging_face_id"}.getStr(id),
+                   "limit": {"context": m{"context_length"}.getInt(0),
+                             "output": m{"max_output_length"}.getInt(0)},
+                   "cost": {"input": perM(p{"prompt"}.getStr("")),
+                            "output": perM(p{"completion"}.getStr("")),
+                            "cache_read": perM(p{"input_cache_reads"}.getStr(""))}}
+    entry["reasoning"] = %hasStr(m{"supported_features"}, "reasoning")
+    entry["attachment"] = %hasStr(m{"input_modalities"}, "image")
+    models[id] = entry
+  %*{"patch": {"synthetic": {"id": "synthetic", "name": "Synthetic",
+                             "models": models}}}
+
+discard comp.tool("synthetic_models_source", %*{
+  "type": "object",
+  "properties": {"version": {"type": "integer",
+    "description": "models source protocol version"}},
+  "description": "Synthetic.new model metadata for the models component " &
+    "(x-models-source v1): a JSON Merge Patch that refreshes the " &
+    "\"synthetic\" provider block with live ids, limits and $/Mtok costs " &
+    "from GET /v1/models.",
+  "x-models-source": {"version": 1, "priority": 200}},
+  proc(c: Component, toolArgs: JsonNode): JsonNode =
+    modelsSourceImpl(toolArgs{"version"}.getInt(1)),
+  %*{"hidden": true, "timeoutMs": 20000})
 
 # ---------------------------------------------------------------------------
 # slash commands (docs/WIRE.md — declarative UI surface)
