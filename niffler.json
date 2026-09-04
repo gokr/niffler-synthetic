@@ -1,0 +1,15 @@
+{
+  "name": "niffler-synthetic",
+  "version": "0.1.0",
+  "description": "First-class Synthetic.new support: subscription usage/quotas tracking (slash /synthetic), live model catalog with pricing, zero-data-retention web search, and a models-catalog source plugin.",
+  "license": "MIT",
+  "components": [
+    {
+      "name": "synthetic",
+      "lang": "nim",
+      "main": "synthetic/main.nim",
+      "defines": ["ssl"],
+      "description": "Synthetic.new usage tracking, model catalog, web search"
+    }
+  ]
+}
