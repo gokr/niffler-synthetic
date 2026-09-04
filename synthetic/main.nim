@@ -185,8 +185,34 @@ proc historyDoc(): JsonNode =
 # ---------------------------------------------------------------------------
 # tools
 
+proc usageHistory(limit: int): JsonNode =
+  ## Shared by synthetic_history and the slash history flag: the most
+  ## recent stored snapshots, oldest first, with deltas vs the previous.
+  let doc = historyDoc()
+  if doc == nil:
+    return %*{"ok": true, "history": [],
+              "note": "no usage tracked yet — call synthetic_usage"}
+  var hist: JsonNode = doc{"history"}
+  if hist == nil or hist.kind != JArray or hist.len == 0:
+    return %*{"ok": true, "history": []}
+  let n = min(max(limit, 1), maxHistory)
+  let start = max(0, hist.len - n)
+  var res = newJArray()
+  for i in start ..< hist.len:
+    var e = copy(hist[i])
+    if i > 0:
+      e["dSubRequests"] = %(hist[i]{"subRequests"}.getInt(0) -
+                            hist[i-1]{"subRequests"}.getInt(0))
+      e["dWeeklyPct"] = %(hist[i]{"weeklyPct"}.getFloat(0) -
+                           hist[i-1]{"weeklyPct"}.getFloat(0))
+      e["dFiveRemaining"] = %(hist[i]{"fiveRemaining"}.getFloat(0) -
+                                hist[i-1]{"fiveRemaining"}.getFloat(0))
+    res.add(e)
+  return %*{"ok": true, "count": res.len, "history": res,
+            "snapshots": hist.len}
+
 comp.tool(%*{"onDemand": true}):
-  proc synthetic_usage(raw: bool = false): JsonNode =
+  proc synthetic_usage(raw: bool = false, history: bool = false): JsonNode =
     ## Current Synthetic.new subscription usage and rate limits: requests
     ## this billing cycle, weekly token credits (percent and $ remaining,
     ## next regen), the rolling five-hour limit, and the hourly search
@@ -194,6 +220,17 @@ comp.tool(%*{"onDemand": true}):
     ## usage is trackable over time — synthetic_history reads it back.
     ## This is also the /synthetic slash command.
     ## - raw: return the provider's full quota JSON instead of the summary
+    ## - history: show tracked snapshots with deltas instead of polling
+    if history:
+      var res = usageHistory(5)
+      let hist = res{"history"}
+      if hist != nil and hist.kind == JArray and hist.len > 0:
+        let last = hist[^1]
+        res["summary"] = %("tracked: " & $last{"subRequests"}.getInt(0) &
+          "/" & $last{"subLimit"}.getInt(0) & " requests, weekly credits " &
+          last{"weeklyCredits"}.getStr("?") & " left (" &
+          last{"weeklyPct"}.getFloat(0).formatFloat(ffDecimal, 1) & "%)")
+      return res
     let quotas = synRequest(HttpGET, "/v2/quotas")
     if raw:
       return %*{"ok": true, "quotas": quotas,
@@ -209,28 +246,7 @@ comp.tool(%*{"onDemand": true}):
     ## (subscription requests, weekly credit percentage). Empty when
     ## nothing has been tracked yet.
     ## - limit: how many of the most recent snapshots to show (1-60)
-    let doc = historyDoc()
-    if doc == nil:
-      return %*{"ok": true, "history": [],
-                "note": "no usage tracked yet — call synthetic_usage"}
-    var hist: JsonNode = doc{"history"}
-    if hist == nil or hist.kind != JArray or hist.len == 0:
-      return %*{"ok": true, "history": []}
-    let n = min(max(limit, 1), maxHistory)
-    let start = max(0, hist.len - n)
-    var res = newJArray()
-    for i in start ..< hist.len:
-      var e = copy(hist[i])
-      if i > 0:
-        e["dSubRequests"] = %(hist[i]{"subRequests"}.getInt(0) -
-                              hist[i-1]{"subRequests"}.getInt(0))
-        e["dWeeklyPct"] = %(hist[i]{"weeklyPct"}.getFloat(0) -
-                             hist[i-1]{"weeklyPct"}.getFloat(0))
-        e["dFiveRemaining"] = %(hist[i]{"fiveRemaining"}.getFloat(0) -
-                                  hist[i-1]{"fiveRemaining"}.getFloat(0))
-      res.add(e)
-    return %*{"ok": true, "count": res.len, "history": res,
-              "snapshots": hist.len}
+    usageHistory(limit)
 
 comp.tool(%*{"onDemand": true}):
   proc synthetic_models(full: bool = false): JsonNode =
