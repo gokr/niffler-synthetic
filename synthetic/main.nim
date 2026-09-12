@@ -92,8 +92,9 @@ proc synRequest(verb: HttpMethod, path: string, body: JsonNode = nil): JsonNode 
 # usage tracking (store kind "synthetic", id "usage")
 
 proc compact(quotas: JsonNode): JsonNode =
-  ## The human-first usage payload: one summary line plus the numbers that
-  ## matter. Sized for a slash-command meta block (~400 chars of JSON).
+  ## The human-first usage payload: a short multi-line summary (one metric
+  ## per line, rendered verbatim by UIs) plus the numbers that matter.
+  ## Sized for a slash-command meta block (~400 chars of JSON).
   let sub = quotas{"subscription"}
   let wk = quotas{"weeklyTokenLimit"}
   let fh = quotas{"rollingFiveHourLimit"}
@@ -103,7 +104,7 @@ proc compact(quotas: JsonNode): JsonNode =
   if sub{"renewsAt"}.getStr("").len >= 16:
     s.add(" (renews " & sub{"renewsAt"}.getStr("")[0 ..< 16] & ")")
   if wk != nil and wk.kind == JObject:
-    s.add(" | weekly credits " & wk{"remainingCredits"}.getStr("?") & "/" &
+    s.add("\nweekly credits " & wk{"remainingCredits"}.getStr("?") & "/" &
           wk{"maxCredits"}.getStr("?") & " (" &
           wk{"percentRemaining"}.getFloat(0).formatFloat(ffDecimal, 1) & "% left")
     if wk{"nextRegenAt"}.getStr("").len >= 16:
@@ -111,11 +112,11 @@ proc compact(quotas: JsonNode): JsonNode =
             wk{"nextRegenAt"}.getStr("")[0 ..< 16])
     s.add(")")
   if fh != nil and fh.kind == JObject:
-    s.add(" | 5h rolling " & fh{"remaining"}.getFloat(0).formatFloat(ffDecimal, 1) &
+    s.add("\n5h rolling " & fh{"remaining"}.getFloat(0).formatFloat(ffDecimal, 1) &
           "/" & $fh{"max"}.getInt(0) &
           (if fh{"limited"}.getBool(false): " LIMITED" else: ""))
   if se != nil and se.kind == JObject:
-    s.add(" | search " & $se{"requests"}.getInt(0) & "/" &
+    s.add("\nsearch " & $se{"requests"}.getInt(0) & "/" &
           $se{"limit"}.getInt(0) & " per hour")
   %*{"summary": s,
      "subscription": {"requests": sub{"requests"}.getInt(0),
