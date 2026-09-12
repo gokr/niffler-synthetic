@@ -311,6 +311,15 @@ proc modelsSourceImpl(version: int): JsonNode =
     let id = m{"id"}.getStr("")
     if id.len == 0: continue
     let p = m{"pricing"}
+    # models.dev shape: modalities drive consumers' input/output filters
+    # (the tui's picker passes input:"text", which strictly requires this
+    # object — a patch entry without it is invisible to pickers).
+    var modsIn = %["text"]
+    if hasStr(m{"input_modalities"}, "image"):
+      modsIn.add(%"image")
+    var modsOut = newJArray()
+    if m{"output_modalities"} == nil or hasStr(m{"output_modalities"}, "text"):
+      modsOut.add(%"text")
     var entry = %*{"id": id,
                    "name": m{"hugging_face_id"}.getStr(id),
                    "limit": {"context": m{"context_length"}.getInt(0),
@@ -318,6 +327,7 @@ proc modelsSourceImpl(version: int): JsonNode =
                    "cost": {"input": perM(p{"prompt"}.getStr("")),
                             "output": perM(p{"completion"}.getStr("")),
                             "cache_read": perM(p{"input_cache_reads"}.getStr(""))}}
+    entry["modalities"] = %*{"input": modsIn, "output": modsOut}
     entry["reasoning"] = %hasStr(m{"supported_features"}, "reasoning")
     entry["attachment"] = %hasStr(m{"input_modalities"}, "image")
     models[id] = entry
