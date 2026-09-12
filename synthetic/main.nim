@@ -359,4 +359,21 @@ let usageParams = parseJson("""
 discard comp.slashCommand("synthetic", "Synthetic.new usage & quotas",
   usageParams, tool = "synthetic_usage")
 
+# Namespaced by package name (docs/WIRE.md, slash naming convention): the
+# slash namespace is global, so these must not be bare /models or /search.
+discard comp.slashCommand("synthetic-models",
+  "Synthetic.new live model catalog (ids, limits, pricing)",
+  parseJson("""
+    [{"name": "full", "kind": "bool", "default": false,
+      "description": "every descriptor field the API returns"}]
+  """), tool = "synthetic_models")
+
+discard comp.slashCommand("synthetic-search",
+  "Web search via Synthetic.new (zero data retention)",
+  parseJson("""
+    [{"name": "query", "kind": "string", "description": "what to search for"},
+     {"name": "results", "kind": "int", "default": 5,
+      "description": "how many hits (1-10)"}]
+  """), tool = "synthetic_search")
+
 comp.run()
