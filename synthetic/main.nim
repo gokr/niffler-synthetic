@@ -367,30 +367,40 @@ comp.tool(%*{"onDemand": true}):
     return %*{"ok": true, "count": res.len, "total": total,
               "models": res}
 
-comp.tool(%*{"onDemand": true}):
-  proc synthetic_search(query: string, results: int = 5): JsonNode =
+comp.tool(%*{"onDemand": true, "effect": "read",
+             "hint": "Search the web through Synthetic (zero data retention): ranked pages with excerpts and dates"}):
+  proc synthetic_search(query: string, results: int = 5,
+                        maxChars: int = 900): JsonNode =
     ## Web search via Synthetic.new's zero-data-retention search API:
-    ## ranked pages with title, url and a text excerpt. Use when you need
-    ## fresh facts from the web. Queries are not retained by the provider;
-    ## searches draw on an hourly quota (see synthetic_usage), separate
-    ## from the subscription's request quota.
+    ## ranked pages with title, url, publication date and a text excerpt.
+    ## Use when you need fresh facts from the web. Queries are not retained
+    ## by the provider; searches draw on an hourly quota (see
+    ## synthetic_usage), separate from the subscription's request quota.
+    ## The API itself takes only the query and returns five hits, so
+    ## `results` and `maxChars` bound what enters the conversation.
     ## - query: what to search for
-    ## - results: how many hits to return (1-10, default 5)
+    ## - results: how many hits to return (1-5; the API returns 5)
+    ## - maxChars: per-result excerpt cap in characters (200-4000, default 900)
     if query.strip().len == 0:
       raise newException(ValueError, "synthetic_search needs a query")
-    let n = min(max(results, 1), 10)
-    let resp = synRequest(HttpPOST, "/v2/search", %*{"query": query})
+    let n = min(max(results, 1), 5)
+    let cap = min(max(maxChars, 200), 4000)
+    let resp = synRequest(HttpPOST, "/v2/search", %*{"query": query}, 30_000)
     var res = newJArray()
     var i = 0
     for r in resp{"results"}:
       if i >= n: break
       var text = r{"text"}.getStr("")
-      if text.len > 900: text = text[0 ..< 900] & "…"
-      res.add(%*{"url": r{"url"}.getStr(""),
-                 "title": r{"title"}.getStr(""),
-                 "text": text})
+      if text.len > cap: text = text[0 ..< cap] & "…"
+      var hit = %*{"url": r{"url"}.getStr(""),
+                   "title": r{"title"}.getStr(""),
+                   "text": text}
+      let published = r{"published"}.getStr("")
+      if published.len > 0: hit["published"] = %published
+      res.add(hit)
       inc i
-    return %*{"ok": true, "query": query, "count": res.len, "results": res}
+    return %*{"ok": true, "query": query, "count": res.len,
+              "returned": resp{"results"}.len, "results": res}
 
 # ---------------------------------------------------------------------------
 # models-catalog source plugin (hidden; docs/MANUAL.md §Source plugins)
