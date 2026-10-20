@@ -403,6 +403,249 @@ comp.tool(%*{"onDemand": true, "effect": "read",
               "returned": resp{"results"}.len, "results": res}
 
 # ---------------------------------------------------------------------------
+# chat / completion / embedding plumbing
+
+proc asText(n: JsonNode): string =
+  ## Message content as plain text: a string, or the text parts of an
+  ## OpenAI content array (image parts have no text and are skipped).
+  if n == nil: return ""
+  case n.kind
+  of JString: return n.getStr("")
+  of JArray:
+    for part in n:
+      if part{"type"}.getStr("text") == "text":
+        result.add(part{"text"}.getStr(""))
+  else: discard
+
+proc messageArray(prompt, system: string, messages: JsonNode,
+                  images: seq[string]): JsonNode =
+  ## Caller messages win; otherwise build [{system?}, {user prompt}]. When
+  ## images are given they are attached as image_url parts to the last
+  ## user message (URL or data: URI, per docs/openai/chat-completions).
+  if messages != nil and messages.kind == JArray and messages.len > 0:
+    result = copy(messages)
+  else:
+    if prompt.strip().len == 0:
+      raise newException(ValueError,
+        "synthetic_chat needs a prompt (or a messages array)")
+    result = newJArray()
+    if system.strip().len > 0:
+      result.add(%*{"role": "system", "content": system})
+    result.add(%*{"role": "user", "content": prompt})
+  if images.len == 0: return
+  var idx = -1
+  for i in countdown(result.len - 1, 0):
+    if result[i]{"role"}.getStr("") == "user":
+      idx = i
+      break
+  if idx < 0:
+    raise newException(ValueError,
+      "images need a user message to attach to")
+  var parts = newJArray()
+  let content = result[idx]{"content"}
+  if content != nil and content.kind == JString and content.getStr("").len > 0:
+    parts.add(%*{"type": "text", "text": content.getStr("")})
+  elif content != nil and content.kind == JArray:
+    for p in content:
+      parts.add(p)
+  for img in images:
+    parts.add(%*{"type": "image_url", "image_url": {"url": img}})
+  result[idx]["content"] = parts
+
+proc usageSummary(usage: JsonNode): JsonNode =
+  ## One usage shape for chat/completion/embedding replies, nil-safe.
+  if usage == nil or usage.kind != JObject: return newJObject()
+  let inp = usage{"prompt_tokens"}.getInt(usage{"input_tokens"}.getInt(0))
+  let outp = usage{"completion_tokens"}.getInt(usage{"output_tokens"}.getInt(0))
+  result = %*{"inputTokens": inp, "outputTokens": outp,
+              "totalTokens": usage{"total_tokens"}.getInt(inp + outp)}
+  let cached = usage{"prompt_tokens_details"}{"cached_tokens"}.getInt(
+               usage{"cache_read_input_tokens"}.getInt(0))
+  if cached > 0: result["cachedInputTokens"] = %cached
+
+proc aggregateSse(raw: string): tuple[content, reasoning: string,
+                                      model, finishReason: string,
+                                      usage: JsonNode, toolCalls: JsonNode] =
+  ## Fold an OpenAI-style SSE chat stream into one message. The provider
+  ## sends `delta.content`, `delta.reasoning`/`delta.reasoning_content`
+  ## and, for tool calls, per-index `delta.tool_calls` fragments whose
+  ## name/arguments arrive split across chunks.
+  var calls = newJArray()
+  var argsByIndex: seq[string]
+  for line in raw.splitLines():
+    let t = line.strip()
+    if not t.startsWith("data:"): continue
+    let payload = t[5 .. ^1].strip()
+    if payload.len == 0 or payload == "[DONE]": continue
+    var chunk: JsonNode
+    try:
+      chunk = parseJson(payload)
+    except CatchableError:
+      continue
+    if chunk{"model"}.getStr("").len > 0:
+      result.model = chunk{"model"}.getStr("")
+    if chunk{"usage"} != nil and chunk{"usage"}.kind == JObject:
+      result.usage = chunk{"usage"}
+    let choices = chunk{"choices"}
+    if choices == nil or choices.kind != JArray: continue
+    for choice in choices:
+      let delta = choice{"delta"}
+      if delta != nil and delta.kind == JObject:
+        let c = delta{"content"}.getStr("")
+        if c.len > 0: result.content.add(c)
+        var r = delta{"reasoning"}.getStr("")
+        if r.len == 0: r = delta{"reasoning_content"}.getStr("")
+        if r.len > 0: result.reasoning.add(r)
+        let tc = delta{"tool_calls"}
+        if tc != nil and tc.kind == JArray:
+          for frag in tc:
+            let idx = frag{"index"}.getInt(0)
+            while calls.len <= idx:
+              calls.add(%*{"id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}})
+              argsByIndex.add("")
+            let fn = frag{"function"}
+            if fn != nil:
+              if fn{"name"}.getStr("").len > 0:
+                calls[idx]["function"]["name"] = %fn{"name"}.getStr("")
+              argsByIndex[idx].add(fn{"arguments"}.getStr(""))
+            if frag{"id"}.getStr("").len > 0:
+              calls[idx]["id"] = %frag{"id"}.getStr("")
+      let fr = choice{"finish_reason"}.getStr("")
+      if fr.len > 0: result.finishReason = fr
+  for i in 0 ..< calls.len:
+    calls[i]["function"]["arguments"] = %argsByIndex[i]
+  if calls.len > 0: result.toolCalls = calls
+
+# ---------------------------------------------------------------------------
+# tools
+
+comp.tool(%*{"onDemand": true, "effect": "read", "timeoutMs": 600000,
+             "hint": "Auxiliary one-shot completion with an explicit model: a cheap/fast model for a subtask, a vision read, a JSON extraction — not a conversation path (core's chat owns that); reports which model answered"}):
+  proc synthetic_chat(prompt: string = "", model: string = defaultModel,
+                      systemPrompt: string = "", messages: JsonNode = nil,
+                      images: seq[string] = @[], maxTokens: int = 1024,
+                      temperature: float = -1.0, topP: float = -1.0,
+                      topK: int = -1, stop: seq[string] = @[],
+                      seed: int = 0, reasoningEffort: string = "",
+                      jsonMode: bool = false, tools: JsonNode = nil,
+                      toolChoice: string = "", stream: bool = false,
+                      timeout: int = 120000): JsonNode =
+    ## One auxiliary OpenAI-compatible completion on Synthetic.new
+    ## (POST /openai/v1/chat/completions).
+    ##
+    ## This is NOT the way to run the conversation: core's hidden `chat`
+    ## (the llm component) owns that, with retries, cancellation, context
+    ## admission, compaction accounting and provider/model resolution.
+    ## Use this for one-shot auxiliary work where choosing the model is the
+    ## point — a cheap small model for a classification or extraction
+    ## instead of the session's model, a vision read, or reading back which
+    ## concrete model a `syn:` alias currently resolves to so it can be
+    ## pinned. Costs one billed request, has no retry and no cancellation,
+    ## and does not appear in the session's usage accounting.
+    ##
+    ## Give either a prompt (plus an optional system prompt) or a full
+    ## OpenAI messages array. Returns the assistant text, the reasoning
+    ## trace when the model exposes one, tool calls, token usage and the
+    ## concrete model that answered. Give the model its own `systemPrompt`
+    ## rather than the harness's.
+    ## - prompt: user message text (ignored when messages is given)
+    ## - model: model id or syn: alias (default syn:small:text)
+    ## - systemPrompt: system message (ignored when messages is given)
+    ## - messages: OpenAI-style messages array [{role, content}], for multi-turn
+    ## - images: image URLs or data: URIs attached to the last user message
+    ##   (only for vision models — check synthetic_models {vision: true})
+    ## - maxTokens: output token cap, reasoning tokens included (default 1024)
+    ## - temperature: sampling randomness 0.0-2.0, omitted when negative
+    ## - topP: nucleus sampling threshold 0.0-1.0, omitted when negative
+    ## - topK: limit sampling to the top K tokens, omitted when negative
+    ## - stop: stop sequence(s)
+    ## - seed: random seed for deterministic sampling, omitted when 0
+    ## - reasoningEffort: low|medium|high (model-specific efforts in
+    ##   synthetic_models.reasoningEfforts); empty leaves the model default
+    ## - jsonMode: ask for a JSON object reply (response_format json_object)
+    ## - tools: OpenAI tool definitions array the model may call
+    ## - toolChoice: auto|none|required when tools are given
+    ## - stream: request SSE and fold it back into one message (required for
+    ##   infinite: aliases, which are slow by design; no live deltas here)
+    ## - timeout: request timeout in ms (default 120000, max 600000)
+    var body = %*{"model": (if model.strip().len > 0: model else: defaultModel),
+                  "messages": messageArray(prompt, systemPrompt, messages,
+                                           images)}
+    if maxTokens > 0: body["max_tokens"] = %maxTokens
+    if temperature >= 0: body["temperature"] = %temperature
+    if topP >= 0: body["top_p"] = %topP
+    if topK >= 0: body["top_k"] = %topK
+    if stop.len > 0: body["stop"] = %stop
+    if seed != 0: body["seed"] = %seed
+    if reasoningEffort.strip().len > 0:
+      body["reasoning_effort"] = %reasoningEffort.strip()
+    if jsonMode: body["response_format"] = %*{"type": "json_object"}
+    if tools != nil and tools.kind == JArray and tools.len > 0:
+      body["tools"] = tools
+      if toolChoice.strip().len > 0: body["tool_choice"] = %toolChoice.strip()
+    let ms = min(max(timeout, 1000), 600_000)
+    var content, reasoning, finishReason, answered: string
+    var usage, toolCalls: JsonNode
+    if stream:
+      body["stream"] = %true
+      body["stream_options"] = %*{"include_usage": true}
+      let agg = aggregateSse(synRequestRaw(HttpPOST,
+        "/openai/v1/chat/completions", body, ms))
+      content = agg.content
+      reasoning = agg.reasoning
+      finishReason = agg.finishReason
+      answered = agg.model
+      usage = agg.usage
+      toolCalls = agg.toolCalls
+    else:
+      let resp = synRequest(HttpPOST, "/openai/v1/chat/completions", body, ms)
+      answered = resp{"model"}.getStr("")
+      usage = resp{"usage"}
+      let choice = resp{"choices"}{0}
+      if choice != nil and choice.kind == JObject:
+        finishReason = choice{"finish_reason"}.getStr("")
+        let msg = choice{"message"}
+        content = asText(msg{"content"})
+        reasoning = msg{"reasoning_content"}.getStr("")
+        if reasoning.len == 0: reasoning = msg{"reasoning"}.getStr("")
+        let tc = msg{"tool_calls"}
+        if tc != nil and tc.kind == JArray and tc.len > 0:
+          # keep the OpenAI request/echo shape: the provider also stamps an
+          # index here, which only means something inside a stream
+          toolCalls = newJArray()
+          for call in tc:
+            toolCalls.add(%*{"id": call{"id"}.getStr(""),
+                             "type": call{"type"}.getStr("function"),
+                             "function": {"name": call{"function"}{"name"}.getStr(""),
+                                          "arguments": call{"function"}{"arguments"}.getStr("")}})
+    var res = %*{"ok": true, "model": answered,
+                 "requestedModel": model, "content": content,
+                 "finishReason": finishReason,
+                 "usage": usageSummary(usage)}
+    if reasoning.len > 0: res["reasoning"] = %reasoning
+    if toolCalls != nil: res["toolCalls"] = toolCalls
+    if content.len == 0 and toolCalls == nil and reasoning.len > 0:
+      res["note"] = %("empty content — the model spent the whole " &
+        $maxTokens & "-token budget on reasoning; raise maxTokens")
+    return res
+
+# The macro derives the schema from the Nim signature, and JsonNode maps to
+# {"type": "object"}; `messages` and `tools` are arrays of objects on the wire,
+# so correct the advertisement before the registration is published.
+
+proc advertiseArray(toolName, prop, itemsKind: string) =
+  for t in comp.tools.mitems:
+    if t.name != toolName: continue
+    let p = t.schema{"properties"}{prop}
+    if p == nil or p.kind != JObject: continue
+    p["type"] = %"array"
+    p["items"] = %*{"type": itemsKind}
+
+advertiseArray("synthetic_chat", "messages", "object")
+advertiseArray("synthetic_chat", "tools", "object")
+
+# ---------------------------------------------------------------------------
 # models-catalog source plugin (hidden; docs/MANUAL.md §Source plugins)
 # Registered via the low-level API: x-models-source is a top-level schema
 # key, not part of x-harness.
