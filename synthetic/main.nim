@@ -732,6 +732,57 @@ discard comp.tool("synthetic_models_source", %*{
   %*{"hidden": true, "timeoutMs": 20000})
 
 # ---------------------------------------------------------------------------
+# selftest (docs/WIRE.md — /doctor fans out to it; the two probes are free:
+# /v2/quotas never counts against subscription limits and /openai/v1/models
+# is a catalog read, so neither spends a request or a search credit)
+
+discard comp.selfTest(proc(c: Component, args: JsonNode): JsonNode =
+  let deep = args{"deep"}.getBool(false)
+  var checks = newJArray()
+
+  proc run(name: string, probe: proc(): string): JsonNode =
+    ## One check: the probe returns its detail string or raises.
+    let started = epochTime()
+    var ok = true
+    var detail = ""
+    try:
+      detail = probe()
+    except CatchableError as e:
+      ok = false
+      detail = e.msg
+    result = %*{"name": name, "ok": ok, "detail": detail,
+                "ms": int((epochTime() - started) * 1000)}
+
+  checks.add(run("api-key", proc(): string =
+    discard apiKey()
+    "resolved (value never logged)"))
+  checks.add(run("base-url", proc(): string = baseUrl()))
+  checks.add(run("quotas", proc(): string =
+    let q = synRequest(HttpGET, "/v2/quotas")
+    $q{"subscription"}{"limit"}.getInt(0) & " requests per cycle"))
+  checks.add(run("models", proc(): string =
+    let n = synRequest(HttpGET, "/openai/v1/models"){"data"}.len
+    if n == 0: raise newException(ValueError, "empty catalog")
+    $n & " catalog entries"))
+  checks.add(run("tools", proc(): string =
+    var names: seq[string] = @[]
+    for t in comp.tools:
+      if not t.schema{"x-harness"}{"hidden"}.getBool(false): names.add(t.name)
+    $names.len & " exposed: " & names.join(", ")))
+  if deep:
+    checks.add(run("search", proc(): string =
+      let r = synRequest(HttpPOST, "/v2/search",
+                         %*{"query": "synthetic.new api"}, 30_000)
+      let n = r{"results"}.len
+      if n == 0: raise newException(ValueError, "no search hits")
+      $n & " hits (one search credit)"))
+  var failed = 0
+  for ck in checks:
+    if not ck{"ok"}.getBool(false): inc failed
+  %*{"ok": failed == 0, "summary": $checks.len & " checks, " &
+       $failed & " failed", "checks": checks})
+
+# ---------------------------------------------------------------------------
 # slash commands (docs/WIRE.md — declarative UI surface)
 
 let usageParams = parseJson("""
@@ -771,5 +822,25 @@ discard comp.slashCommand("synthetic-search",
       "description": "per-result excerpt cap"}]
   """), tool = "synthetic_search")
 
+discard comp.slashCommand("synthetic-chat",
+  "One-shot chat completion via Synthetic.new",
+  parseJson("""
+    [{"name": "prompt", "kind": "string", "description": "user message"},
+     {"name": "model", "kind": "enum", "default": "syn:small:text",
+      "values": ["syn:small:text", "syn:small:vision", "syn:large:text",
+                 "syn:large:vision"],
+      "description": "model id or syn: alias"},
+     {"name": "systemPrompt", "kind": "string", "description": "system message"},
+     {"name": "jsonMode", "kind": "bool", "default": false,
+      "description": "ask for a JSON object reply"}]
+  """), tool = "synthetic_chat")
+
+discard comp.slashCommand("synthetic-tokens",
+  "Count prompt tokens via Synthetic.new",
+  parseJson("""
+    [{"name": "prompt", "kind": "string", "description": "text to count"},
+     {"name": "model", "kind": "string", "default": "syn:small:text",
+      "description": "model whose tokenizer is used"}]
+  """), tool = "synthetic_count_tokens")
 
 comp.run()
