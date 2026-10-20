@@ -157,7 +157,11 @@ proc compact(quotas: JsonNode): JsonNode =
   if se != nil and se.kind == JObject:
     s.add("\nsearch " & $se{"requests"}.getInt(0) & "/" &
           $se{"limit"}.getInt(0) & " per hour")
-  %*{"summary": s,
+  let ft = quotas{"freeToolCalls"}
+  if ft != nil and ft.kind == JObject and ft{"limit"}.getInt(0) > 0:
+    s.add("\nfree tool calls " & $ft{"requests"}.getInt(0) & "/" &
+          $ft{"limit"}.getInt(0) & " this cycle")
+  %*{"ok": true, "summary": s,
      "subscription": {"requests": sub{"requests"}.getInt(0),
                       "limit": sub{"limit"}.getInt(0)},
      "weekly": {"percentRemaining": wk{"percentRemaining"}.getFloat(0),
@@ -167,7 +171,9 @@ proc compact(quotas: JsonNode): JsonNode =
                          "max": fh{"max"}.getInt(0),
                          "limited": fh{"limited"}.getBool(false)},
      "search": {"requests": se{"requests"}.getInt(0),
-                "limit": se{"limit"}.getInt(0)}}
+                "limit": se{"limit"}.getInt(0)},
+     "freeToolCalls": {"requests": ft{"requests"}.getInt(0),
+                       "limit": ft{"limit"}.getInt(0)}}
 
 proc snapshotEntry(quotas: JsonNode): JsonNode =
   ## One compact history point (store doc size stays ~10 KB at the cap).
