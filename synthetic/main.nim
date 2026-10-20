@@ -1,8 +1,11 @@
 ## synthetic — first-class Synthetic.new support for Niffler.
 ##
-## https://dev.synthetic.new/docs/api/overview — OpenAI-compatible inference
-## (`https://api.synthetic.new/v1`), plus two Synthetic-specific v2 endpoints:
-## usage quotas (docs/synthetic/quotas) and zero-data-retention web search.
+## https://dev.synthetic.new/docs/api/overview — an OpenAI-compatible and an
+## Anthropic-compatible inference API on `https://api.synthetic.new`
+## (`/openai/v1`, `/anthropic/v1`), plus Synthetic-specific endpoints for
+## usage quotas (docs/synthetic/quotas), zero-data-retention web search
+## (docs/synthetic/search), chat, text completion, embeddings and token
+## counting.
 ##
 ## What this component provides:
 ## - synthetic_usage  — live subscription usage + rate limits (the
@@ -10,26 +13,52 @@
 ##   (kind "synthetic", id "usage") so usage is trackable over time.
 ## - synthetic_history — stored usage snapshots with deltas.
 ## - synthetic_models — the live model catalog: syn: aliases and pinned
-##   hf: ids with context/output limits, per-token pricing, features.
+##   hf: ids with context/output limits, per-token pricing, features —
+##   filterable by capability, context window and free-text query.
 ## - synthetic_search — web search (results only enter the conversation;
 ##   the provider retains no query data).
+## - synthetic_chat — one auxiliary OpenAI-compatible completion: a prompt
+##   or a full messages array, vision images, JSON mode, reasoning effort,
+##   tool schemas, streaming aggregation, and a resolved-model readback
+##   (`syn:` alias → concrete hf: id). Not a conversation path — core's
+##   hidden `chat` owns that; this is for one-shot work where an explicit
+##   model override is the point.
+## - synthetic_count_tokens — Anthropic-compatible token counting
+##   (`/anthropic/v1/messages/count_tokens`) for sizing a prompt before
+##   spending a request (subscriber-only endpoint).
 ## - synthetic_models_source — hidden x-models-source plugin: feeds the
 ##   models component a live JSON-Merge-Patch for the "synthetic" provider
 ##   block (ids, limits, $/Mtok costs), so model selection resolves against
 ##   what the endpoint actually serves.
 ##
+## `synthetic` here is the provider's own extra surface, not a replacement
+## for the harness `llm` component: the runner's `chat` tool owns the
+## conversation, these tools serve one-shot calls the conversation itself
+## does not need to route through a configured provider.
+##
 ## Key resolution (never logged): SYNTHETIC_API_KEY env var (harness env or
 ## NIF_ROOT/.env), else the opencode key store
-## (~/.local/share/opencode/auth.json → synthetic.key).
+## (~/.local/share/opencode/auth.json → synthetic.key). The API origin can
+## be overridden with SYNTHETIC_BASE_URL (proxy/self-hosted gateway).
 
-import std/[httpclient, json, os, strutils, times]
+import std/[httpclient, json, math, os, strutils, times]
 import niffler/sdk
 
-let comp = newComponent("synthetic", "0.1.0")
+let comp = newComponent("synthetic", "0.2.0")
 
-const baseUrl = "https://api.synthetic.new"
+const defaultBaseUrl = "https://api.synthetic.new"
+const defaultModel = "syn:small:text"
+  ## Alias for the always-current small text model: cheap and fast, the
+  ## right default for an auxiliary one-shot call.
 const maxHistory = 60
   ## Rolling snapshot cap in the store doc — about two months of daily polls.
+
+proc baseUrl(): string =
+  ## API origin; SYNTHETIC_BASE_URL overrides it (proxy, gateway, tests).
+  result = getEnv("SYNTHETIC_BASE_URL", defaultBaseUrl).strip()
+  while result.len > 1 and result[^1] == '/':
+    result.setLen(result.len - 1)
+  if result.len == 0: result = defaultBaseUrl
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -40,7 +69,9 @@ proc perM(s: string): float =
   var t = s.strip()
   if t.len > 0 and t[0] == '$': t = t[1 .. ^1]
   try:
-    return parseFloat(t) * 1_000_000
+    # six decimals is far below a cent per million tokens and keeps derived
+    # values like 0.44999999999999996 out of the reply
+    return round(parseFloat(t) * 1_000_000 * 1_000_000) / 1_000_000
   except CatchableError:
     return 0.0
 
@@ -68,14 +99,16 @@ proc apiKey(): string =
       "no Synthetic API key — set SYNTHETIC_API_KEY (harness env or " &
       "NIF_ROOT/.env) or log in via opencode (~/.local/share/opencode/auth.json)")
 
-proc synRequest(verb: HttpMethod, path: string, body: JsonNode = nil): JsonNode =
-  ## One authenticated API call; raises IOError with a short, key-free message.
+proc synRequestRaw(verb: HttpMethod, path: string, body: JsonNode = nil,
+                   timeoutMs: int = 20_000): string =
+  ## One authenticated API call; returns the body text (SSE included) and
+  ## raises IOError with a short, key-free message on a non-2xx reply.
   let key = apiKey()
-  let c = newHttpClient("niffler-synthetic/0.1", timeout = 20_000)
+  let c = newHttpClient("niffler-synthetic/0.2", timeout = max(timeoutMs, 1000))
   defer: c.close()
   c.headers = newHttpHeaders({"Authorization": "Bearer " & key,
                               "Content-Type": "application/json"})
-  var resp = c.request(baseUrl & path, verb,
+  var resp = c.request(baseUrl() & path, verb,
                        if body == nil: "" else: $body)
   if not resp.code.is2xx():
     var detail = resp.body.strip()
@@ -83,8 +116,14 @@ proc synRequest(verb: HttpMethod, path: string, body: JsonNode = nil): JsonNode 
     raise newException(IOError,
       "synthetic: HTTP " & $resp.code.int & " from " & path &
       (if detail.len > 0: ": " & detail else: ""))
+  result = resp.body
+
+proc synRequest(verb: HttpMethod, path: string, body: JsonNode = nil,
+                timeoutMs: int = 20_000): JsonNode =
+  ## synRequestRaw plus JSON decoding (the JSON API surface).
+  let raw = synRequestRaw(verb, path, body, timeoutMs)
   try:
-    return parseJson(resp.body)
+    return parseJson(raw)
   except CatchableError as e:
     raise newException(IOError, "synthetic: bad JSON from " & path & ": " & e.msg)
 
