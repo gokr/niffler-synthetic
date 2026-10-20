@@ -630,6 +630,39 @@ comp.tool(%*{"onDemand": true, "effect": "read", "timeoutMs": 600000,
         $maxTokens & "-token budget on reasoning; raise maxTokens")
     return res
 
+comp.tool(%*{"onDemand": true, "effect": "read",
+             "hint": "Count input tokens for a prompt/messages before spending a request"}):
+  proc synthetic_count_tokens(prompt: string = "", systemPrompt: string = "",
+                              messages: JsonNode = nil,
+                              model: string = defaultModel): JsonNode =
+    ## Count input tokens before paying for a request, using the
+    ## Anthropic-compatible endpoint POST /anthropic/v1/messages/count_tokens
+    ## (a subscriber-only endpoint that itself does not count against the
+    ## subscription limit). Use it to check a prompt fits a context window
+    ## or to budget a multi-message conversation.
+    ## - prompt: single user message text (or use messages)
+    ## - systemPrompt: system prompt to include in the count
+    ## - messages: Anthropic-style [{role: user|assistant, content: text}]
+    ## - model: model id or syn: alias whose tokenizer is used
+    var msgs: JsonNode
+    if messages != nil and messages.kind == JArray and messages.len > 0:
+      msgs = copy(messages)
+    elif prompt.strip().len > 0:
+      msgs = %*[{"role": "user", "content": prompt}]
+    else:
+      raise newException(ValueError,
+        "synthetic_count_tokens needs a prompt or a messages array")
+    var body = %*{"model": (if model.strip().len > 0: model else: defaultModel),
+                  "messages": msgs}
+    if systemPrompt.strip().len > 0: body["system"] = %systemPrompt
+    let resp = synRequest(HttpPOST, "/anthropic/v1/messages/count_tokens",
+                          body, 30_000)
+    return %*{"ok": true, "model": model,
+              "inputTokens": resp{"input_tokens"}.getInt(0),
+              "messages": msgs.len,
+              "note": "counts input only; output cost is maxTokens " &
+                      "times the model's output rate"}
+
 # The macro derives the schema from the Nim signature, and JsonNode maps to
 # {"type": "object"}; `messages` and `tools` are arrays of objects on the wire,
 # so correct the advertisement before the registration is published.
