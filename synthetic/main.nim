@@ -257,7 +257,8 @@ proc usageHistory(limit: int): JsonNode =
   return %*{"ok": true, "count": res.len, "history": res,
             "snapshots": hist.len}
 
-comp.tool(%*{"onDemand": true}):
+comp.tool(%*{"onDemand": true,
+             "hint": "Check the Synthetic.new subscription: quota left, weekly credits, 5h window, search quota"}):
   proc synthetic_usage(raw: bool = false, history: bool = false): JsonNode =
     ## Current Synthetic.new subscription usage and rate limits: requests
     ## this billing cycle, weekly token credits (percent and $ remaining,
@@ -285,7 +286,8 @@ comp.tool(%*{"onDemand": true}):
     res["tracked"] = %persistSnapshot(quotas)
     return res
 
-comp.tool(%*{"onDemand": true}):
+comp.tool(%*{"onDemand": true,
+             "hint": "Tracked Synthetic.new usage over time — snapshots with deltas, no live poll"}):
   proc synthetic_history(limit: int = 10): JsonNode =
     ## Recent Synthetic.new usage snapshots recorded by synthetic_usage,
     ## oldest first, each with the delta versus the previous snapshot
@@ -294,7 +296,8 @@ comp.tool(%*{"onDemand": true}):
     ## - limit: how many of the most recent snapshots to show (1-60)
     usageHistory(limit)
 
-comp.tool(%*{"onDemand": true}):
+comp.tool(%*{"onDemand": true, "effect": "read",
+             "hint": "List or filter the live Synthetic.new model catalog — ids, syn: alias targets, context limits, $/Mtok, vision/tools/reasoning"}):
   proc synthetic_models(query: string = "", vision: bool = false,
                         tools: bool = false, reasoning: bool = false,
                         minContext: int = 0, full: bool = false): JsonNode =
@@ -745,7 +748,16 @@ discard comp.slashCommand("synthetic", "Synthetic.new usage & quotas",
 discard comp.slashCommand("synthetic-models",
   "Synthetic.new live model catalog (ids, limits, pricing)",
   parseJson("""
-    [{"name": "full", "kind": "bool", "default": false,
+    [{"name": "query", "kind": "string", "description": "free-text match"},
+     {"name": "vision", "kind": "bool", "default": false,
+      "description": "only image-input models"},
+     {"name": "tools", "kind": "bool", "default": false,
+      "description": "only tool-calling models"},
+     {"name": "reasoning", "kind": "bool", "default": false,
+      "description": "only models with a reasoning mode"},
+     {"name": "minContext", "kind": "int", "default": 0,
+      "description": "minimum context window in tokens"},
+     {"name": "full", "kind": "bool", "default": false,
       "description": "every descriptor field the API returns"}]
   """), tool = "synthetic_models")
 
@@ -754,7 +766,10 @@ discard comp.slashCommand("synthetic-search",
   parseJson("""
     [{"name": "query", "kind": "string", "description": "what to search for"},
      {"name": "results", "kind": "int", "default": 5,
-      "description": "how many hits (1-10)"}]
+      "description": "how many hits (1-5)"},
+     {"name": "maxChars", "kind": "int", "default": 900,
+      "description": "per-result excerpt cap"}]
   """), tool = "synthetic_search")
+
 
 comp.run()
