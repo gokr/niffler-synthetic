@@ -295,27 +295,77 @@ comp.tool(%*{"onDemand": true}):
     usageHistory(limit)
 
 comp.tool(%*{"onDemand": true}):
-  proc synthetic_models(full: bool = false): JsonNode =
+  proc synthetic_models(query: string = "", vision: bool = false,
+                        tools: bool = false, reasoning: bool = false,
+                        minContext: int = 0, full: bool = false): JsonNode =
     ## The live Synthetic.new model catalog: syn: aliases (always route to
     ## the current recommended model) and pinned hf: ids, each with
     ## context/output limits, per-token pricing and supported features.
-    ## Use before naming a model in a provider or llm call.
+    ## Use before naming a model in a provider, llm or synthetic_chat call.
+    ## Filters are ANDed. Every entry is either an alias (kind "alias":
+    ## syn:/infinite:, huggingFace names the model it currently resolves to —
+    ## the value to pin if you need a fixed model) or a pinned hf: model
+    ## (kind "model"). `free` marks $0 entries; `categories` lists the
+    ## provider's own labels (e.g. "recommended").
+    ## - query: free-text match on id, huggingFace id, display name, description
+    ## - vision: only models that accept image input
+    ## - tools: only models with tool calling
+    ## - reasoning: only models with a reasoning/thinking mode
+    ## - minContext: only models with at least this many context tokens
     ## - full: include every descriptor field the API returns
-    let data = synRequest(HttpGET, "/v1/models"){"data"}
-    if full:
-      return %*{"ok": true, "count": data.len, "models": data}
+    let data = synRequest(HttpGET, "/openai/v1/models"){"data"}
+    let needle = query.strip().toLowerAscii()
     var res = newJArray()
+    var total = 0
     for m in data:
+      inc total
+      let id = m{"id"}.getStr("")
+      let hf = m{"hugging_face_id"}.getStr("")
+      let isVision = hasStr(m{"input_modalities"}, "image")
+      let feats = m{"supported_features"}
+      if vision and not isVision: continue
+      if tools and not hasStr(feats, "tools"): continue
+      if reasoning and not hasStr(feats, "reasoning"): continue
+      if minContext > 0 and m{"context_length"}.getInt(0) < minContext: continue
+      if needle.len > 0:
+        let hay = (id & " " & hf & " " & m{"display_name"}.getStr("") &
+                   " " & m{"description"}.getStr("")).toLowerAscii()
+        if hay.find(needle) < 0: continue
       let p = m{"pricing"}
-      res.add(%*{"id": m{"id"}.getStr(""),
-                 "huggingFace": m{"hugging_face_id"}.getStr(""),
-                 "context": m{"context_length"}.getInt(0),
-                 "maxOutput": m{"max_output_length"}.getInt(0),
-                 "input$/M": perM(p{"prompt"}.getStr("")),
-                 "output$/M": perM(p{"completion"}.getStr("")),
-                 "features": m{"supported_features"},
-                 "vision": hasStr(m{"input_modalities"}, "image")})
-    return %*{"ok": true, "count": res.len, "models": res}
+      let inCost = perM(p{"prompt"}.getStr(""))
+      let outCost = perM(p{"completion"}.getStr(""))
+      # The provider's `name` is the alias for syn:/infinite: entries and the
+      # bare owner/model path for pinned hf: ones; `huggingFace` is the model
+      # the alias resolves to right now, which is what a pin should use.
+      var entry = %*{"id": id,
+                     "name": m{"name"}.getStr(""),
+                     "huggingFace": hf,
+                     "displayName": m{"display_name"}.getStr(""),
+                     "kind": (if id.startsWith("hf:"): "model" else: "alias"),
+                     "alwaysOn": m{"always_on"}.getBool(false),
+                     "context": m{"context_length"}.getInt(0),
+                     "maxOutput": m{"max_output_length"}.getInt(0),
+                     "input$/M": inCost,
+                     "output$/M": outCost,
+                     "free": inCost == 0.0 and outCost == 0.0,
+                     "features": feats,
+                     "vision": isVision}
+      if m{"categories"} != nil and m{"categories"}.len > 0:
+        entry["categories"] = m{"categories"}
+      if m{"reasoning_parameters"}{"efforts"} != nil:
+        entry["reasoningEfforts"] = m{"reasoning_parameters"}{"efforts"}
+      if full:
+        # every remaining descriptor field: the ones promoted to the compact
+        # (camelCase) shape are skipped so the result has one spelling each
+        const promoted = ["id", "name", "hugging_face_id", "display_name",
+                          "categories", "context_length", "max_output_length",
+                          "pricing", "input_modalities", "supported_features",
+                          "reasoning_parameters", "always_on"]
+        for k, v in m:
+          if k notin promoted: entry[k] = v
+      res.add(entry)
+    return %*{"ok": true, "count": res.len, "total": total,
+              "models": res}
 
 comp.tool(%*{"onDemand": true}):
   proc synthetic_search(query: string, results: int = 5): JsonNode =
