@@ -730,10 +730,14 @@ proc modelsSourceImpl(version: int): JsonNode =
     # "this model has no reasoning".
     let efforts = m{"reasoning_parameters"}{"efforts"}
     if efforts != nil and efforts.kind == JArray and efforts.len > 0:
+      # Dedupe on a plain seq: `notin` against a JsonNode array compares a
+      # string to a node and trips json.nim's JObject assertion.
+      var seen: seq[string] = @[]
       var levels = newJArray()
       for e in efforts:
         let level = e.getStr("")
-        if level.len > 0 and level notin levels:
+        if level.len > 0 and level notin seen:
+          seen.add(level)
           levels.add(%level)
       if levels.len > 0: entry["reasoning_efforts"] = levels
     models[id] = entry
