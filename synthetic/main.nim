@@ -36,9 +36,12 @@
 ## conversation, these tools serve one-shot calls the conversation itself
 ## does not need to route through a configured provider.
 ##
-## Key resolution (never logged): SYNTHETIC_API_KEY env var (harness env or
-## NIF_ROOT/.env), else the opencode key store
-## (~/.local/share/opencode/auth.json → synthetic.key). The API origin can
+## Key resolution (never logged): the harness's own `synthetic` provider
+## record first (the `provider` component holds the key, so an operator stores
+## it once and everything — `llm`, this plugin — uses it), then
+## SYNTHETIC_API_KEY (harness env or NIF_ROOT/.env) as an explicit override.
+## Another tool's credential store is deliberately not consulted: a Niffler
+## component resolves credentials from Niffler. The API origin can
 ## be overridden with SYNTHETIC_BASE_URL (proxy/self-hosted gateway).
 
 import std/[httpclient, json, math, os, strutils, times]
@@ -84,20 +87,48 @@ proc hasStr(arr: JsonNode, val: string): bool =
 # ---------------------------------------------------------------------------
 # key + transport
 
-proc apiKey(): string =
-  ## SYNTHETIC_API_KEY env (dotenv loaded by the SDK), else opencode's store.
-  result = getEnv("SYNTHETIC_API_KEY")
+proc apiKey*(): string =
+  ## The harness's own credential for Synthetic, in priority order:
+  ##
+  ##  1. `SYNTHETIC_API_KEY` (harness env or NIF_ROOT/.env) — an explicit
+  ##     override always wins;
+  ##  2. the harness's stored **provider record** named `synthetic`. This is
+  ##     the one that matters operationally: the key is already in the store
+  ##     (the `provider` component holds it, `provider_active` reports it),
+  ##     so requiring a SECOND copy in `.env` for the same credential is the
+  ##     duplication this lookup removes. Reading it over the bus is how a
+  ##     component consumes the registry without importing `llm` or any other
+  ##     component's code.
+  ##
+  ## Deliberately NOT consulted: another tool's credential store. This is a
+  ## Niffler component and it resolves credentials from Niffler (env, then the
+  ## provider registry) — reaching into an unrelated harness's state would
+  ## couple the plugin to software it does not own, and a box that happened to
+  ## have that tool configured would silently authenticate with a credential
+  ## nobody chose for this harness.
+  ##
+  ## The value is never logged, echoed or returned in an error — every
+  ## consumer interpolates it only into a header.
+  result = getEnv("SYNTHETIC_API_KEY").strip()
   if result.len == 0:
-    let p = getHomeDir() / ".local" / "share" / "opencode" / "auth.json"
-    if fileExists(p):
-      try:
-        result = parseJson(readFile(p)){"synthetic"}{"key"}.getStr("")
-      except CatchableError:
-        discard
+    try:
+      # Result shape is {ok, provider: {…}, source}: the config is NESTED, so
+      # reading apiKey off the top level silently yields "" and looks exactly
+      # like "no provider stored" — accept either shape rather than assume.
+      let r = comp.request("provider", "provider_get",
+                           %*{"nickname": "synthetic"}, 5_000)
+      let p = if r{"provider"} != nil and r{"provider"}.kind == JObject: r{"provider"}
+              else: r
+      result = p{"apiKey"}.getStr("").strip()
+    except CatchableError:
+      # provider component absent/renamed, or no `synthetic` record yet: the
+      # error below names what to fix instead of failing obscurely here.
+      discard
   if result.len == 0:
     raise newException(ValueError,
-      "no Synthetic API key — set SYNTHETIC_API_KEY (harness env or " &
-      "NIF_ROOT/.env) or log in via opencode (~/.local/share/opencode/auth.json)")
+      "no Synthetic API key — store a `synthetic` provider (the harness's " &
+      "provider record, e.g. provider_add) or set SYNTHETIC_API_KEY " &
+      "(harness env or NIF_ROOT/.env)")
 
 proc synRequestRaw(verb: HttpMethod, path: string, body: JsonNode = nil,
                    timeoutMs: int = 20_000): string =
@@ -782,7 +813,11 @@ discard comp.selfTest(proc(c: Component, args: JsonNode): JsonNode =
 
   checks.add(run("api-key", proc(): string =
     discard apiKey()
-    "resolved (value never logged)"))
+    # Name the source without naming the secret: an operator debugging a
+    # missing key needs to know WHICH store answered, and "provider record"
+    # vs "environment" is the difference between fixing the store and the box.
+    if getEnv("SYNTHETIC_API_KEY").strip().len > 0: "resolved from environment"
+    else: "resolved from the `synthetic` provider record (value never logged)"))
   checks.add(run("base-url", proc(): string = baseUrl()))
   checks.add(run("quotas", proc(): string =
     let q = synRequest(HttpGET, "/v2/quotas")

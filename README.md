@@ -68,7 +68,7 @@ shows tracked snapshots with deltas instead of a live poll.
 
 | Variable | Meaning |
 | --- | --- |
-| `SYNTHETIC_API_KEY` | API key — harness environment or `NIF_ROOT/.env` (dotenv), falling back to opencode's key store (`~/.local/share/opencode/auth.json`, key `synthetic`). Never logged. |
+| `SYNTHETIC_API_KEY` | Optional explicit override. Normally you store the key **once** as a `synthetic` provider (`provider_add`), and this component reads it from the harness's provider record over the bus — the same credential `llm` uses. `SYNTHETIC_API_KEY` (harness env or `NIF_ROOT/.env`) wins when set. Another tool's credential store is deliberately not consulted. Never logged. |
 | `SYNTHETIC_BASE_URL` | API origin; defaults to `https://api.synthetic.new`. Point it at a gateway or a test double. |
 
 Get a key at <https://dev.synthetic.new>.
