@@ -714,6 +714,28 @@ proc modelsSourceImpl(version: int): JsonNode =
     entry["modalities"] = %*{"input": modsIn, "output": modsOut}
     entry["reasoning"] = %hasStr(m{"supported_features"}, "reasoning")
     entry["attachment"] = %hasStr(m{"input_modalities"}, "image")
+    # Reasoning effort levels this model accepts, in the provider's order.
+    # models.dev has no field for this (only a boolean `reasoning`), so it is
+    # a plugin-only extension: consumers use it to constrain an effort ladder
+    # (shift-tab in a UI, core's session.thinking enum) instead of guessing
+    # low/medium/high/max.
+    #
+    # ADVISORY, NOT A CONTRACT. Probing shows the provider's own list is
+    # wrong in both directions: one alias declared none/low/high/xhigh/max
+    # but rejected `max` with HTTP 400; another declared low/high/max but
+    # accepted medium and xhigh. Never use this to reject a value that
+    # works — use it to narrow what is offered, and fall back to the
+    # caller's own ladder when the key is absent. The key is omitted when
+    # the API declares nothing, so an empty list is never mistaken for
+    # "this model has no reasoning".
+    let efforts = m{"reasoning_parameters"}{"efforts"}
+    if efforts != nil and efforts.kind == JArray and efforts.len > 0:
+      var levels = newJArray()
+      for e in efforts:
+        let level = e.getStr("")
+        if level.len > 0 and level notin levels:
+          levels.add(%level)
+      if levels.len > 0: entry["reasoning_efforts"] = levels
     models[id] = entry
   %*{"patch": {"synthetic": {"id": "synthetic", "name": "Synthetic",
                              "models": models}}}
@@ -724,8 +746,9 @@ discard comp.tool("synthetic_models_source", %*{
     "description": "models source protocol version"}},
   "description": "Synthetic.new model metadata for the models component " &
     "(x-models-source v1): a JSON Merge Patch that refreshes the " &
-    "\"synthetic\" provider block with live ids, limits and $/Mtok costs " &
-    "from GET /v1/models.",
+    "\"synthetic\" provider block with live ids, limits, $/Mtok costs, " &
+    "modalities and the advisory reasoning_efforts levels each model " &
+    "declares, from GET /openai/v1/models.",
   "x-models-source": {"version": 1, "priority": 200}},
   proc(c: Component, toolArgs: JsonNode): JsonNode =
     modelsSourceImpl(toolArgs{"version"}.getInt(1)),
